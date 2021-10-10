@@ -16,11 +16,13 @@ declare(strict_types=1);
 
 namespace Medoo;
 
+use ErrorException;
 use PDO;
 use Exception;
 use PDOException;
 use PDOStatement;
 use InvalidArgumentException;
+use Medoo\Configuration\ConfigurationFactory;
 
 /**
  * The Medoo raw object.
@@ -62,6 +64,30 @@ class Raw
  */
 class Medoo
 {
+
+    private const PDO_TYPE_MAP = [
+        'NULL' => PDO::PARAM_NULL,
+        'integer' => PDO::PARAM_INT,
+        'double' => PDO::PARAM_STR,
+        'boolean' => PDO::PARAM_BOOL,
+        'string' => PDO::PARAM_STR,
+        'object' => PDO::PARAM_STR,
+        'resource' => PDO::PARAM_LOB
+    ];
+
+    private const MEDOO_INFO_OUTPUT = [
+        'server' => 'SERVER_INFO',
+        'driver' => 'DRIVER_NAME',
+        'client' => 'CLIENT_VERSION',
+        'version' => 'SERVER_VERSION',
+        'connection' => 'CONNECTION_STATUS'
+    ];
+
+    private const STMT_REPLACE_REGEX = '/(?!\'[^\s]+\s?)"([\p{L}_][\p{L}\p{N}@$#\-_]*)"(?!\s?[^\s]+\')/u';
+    private const QUERY_REPLACE_REGEX = '/(([`\']).*?)?((FROM|TABLE|INTO|UPDATE|JOIN)\s*)?\<(([\p{L}_][\p{L}\p{N}@$#\-_]*)(\.[\p{L}_][\p{L}\p{N}@$#\-_]*)?)\>([^,]*?\2)?/u';
+    private const TABLE_QUOTE_REGEX = '/^[\p{L}_][\p{L}\p{N}@$#\-_]*$/u';
+    private const COLUMN_QUOTE_REGEX = '/^[\p{L}_][\p{L}\p{N}@$#\-_]*(\.?[\p{L}_][\p{L}\p{N}@$#\-_]*)?$/u';
+
     /**
      * The PDO object.
      *
@@ -233,11 +259,40 @@ class Medoo
             $this->logging = $options['logging'];
         }
 
-        $option = $options['option'] ?? [];
         $commands = (isset($options['command']) && is_array($options['command'])) ?
             $options['command'] :
             [];
 
+        $commands = $this->setStandardIdentifierMode($commands);
+       
+
+        if (isset($options['pdo'])) {
+            $this->handlePDOOption($options, $commands);
+            return;
+        }
+
+        $attr = ConfigurationFactory::getConfiguration($this->type, $options);
+
+        if (!isset($attr)) {
+            throw new InvalidArgumentException('Incorrect connection options.');
+        }
+
+        $driver = $attr['driver'];
+
+        if(!$this->isDriverSupported($attr['driver'])) {
+            throw new InvalidArgumentException("Unsupported PDO driver: {$driver}.");
+        }
+
+        unset($attr['driver']);
+
+        $dsn = $driver . ':' . implode(';', $this->makeStack($attr));
+
+        $commands = $this->getCharacterSetCommand($options, $commands);
+        $this->dsn = $dsn;
+        $this->connectToDatabase($dsn, $options, $commands);
+    }
+
+    private function setStandardIdentifierMode($commands) : array {
         switch ($this->type) {
 
             case 'mysql':
@@ -256,224 +311,75 @@ class Medoo
                 break;
         }
 
-        if (isset($options['pdo'])) {
-            if (!$options['pdo'] instanceof PDO) {
-                throw new InvalidArgumentException('Invalid PDO object supplied.');
-            }
+        return $commands;
+    }
 
-            $this->pdo = $options['pdo'];
-
-            foreach ($commands as $value) {
-                $this->pdo->exec($value);
-            }
-
-            return;
+    private function handlePDOOption(array $options, array $commands) : void {
+        if (!$options['pdo'] instanceof PDO) {
+            throw new InvalidArgumentException('Invalid PDO object supplied.');
         }
 
-        if (isset($options['dsn'])) {
-            if (is_array($options['dsn']) && isset($options['dsn']['driver'])) {
-                $attr = $options['dsn'];
+        $this->pdo = $options['pdo'];
+
+        $this->executeCommands($commands);
+    }
+
+    private function getCharacterSetCommand($options, $commands) : array {
+        if ( in_array($this->type, ['mysql', 'pgsql', 'sybase', 'mssql']) && isset($options['charset'])) {
+
+            if($this->type === 'mysql' && isset($options['collation'])) {
+                $collateString = " COLLATE '{$options['collation']}'";
             } else {
-                throw new InvalidArgumentException('Invalid DSN option supplied.');
-            }
-        } else {
-            if (
-                isset($options['port']) &&
-                is_int($options['port'] * 1)
-            ) {
-                $port = $options['port'];
+                $collateString = '';
             }
 
-            $isPort = isset($port);
-
-            switch ($this->type) {
-
-                case 'mysql':
-                    $attr = [
-                        'driver' => 'mysql',
-                        'dbname' => $options['database']
-                    ];
-
-                    if (isset($options['socket'])) {
-                        $attr['unix_socket'] = $options['socket'];
-                    } else {
-                        $attr['host'] = $options['host'];
-
-                        if ($isPort) {
-                            $attr['port'] = $port;
-                        }
-                    }
-
-                    break;
-
-                case 'pgsql':
-                    $attr = [
-                        'driver' => 'pgsql',
-                        'host' => $options['host'],
-                        'dbname' => $options['database']
-                    ];
-
-                    if ($isPort) {
-                        $attr['port'] = $port;
-                    }
-
-                    break;
-
-                case 'sybase':
-                    $attr = [
-                        'driver' => 'dblib',
-                        'host' => $options['host'],
-                        'dbname' => $options['database']
-                    ];
-
-                    if ($isPort) {
-                        $attr['port'] = $port;
-                    }
-
-                    break;
-
-                case 'oracle':
-                    $attr = [
-                        'driver' => 'oci',
-                        'dbname' => $options['host'] ?
-                            '//' . $options['host'] . ($isPort ? ':' . $port : ':1521') . '/' . $options['database'] :
-                            $options['database']
-                    ];
-
-                    if (isset($options['charset'])) {
-                        $attr['charset'] = $options['charset'];
-                    }
-
-                    break;
-
-                case 'mssql':
-                    if (isset($options['driver']) && $options['driver'] === 'dblib') {
-                        $attr = [
-                            'driver' => 'dblib',
-                            'host' => $options['host'] . ($isPort ? ':' . $port : ''),
-                            'dbname' => $options['database']
-                        ];
-
-                        if (isset($options['appname'])) {
-                            $attr['appname'] = $options['appname'];
-                        }
-
-                        if (isset($options['charset'])) {
-                            $attr['charset'] = $options['charset'];
-                        }
-                    } else {
-                        $attr = [
-                            'driver' => 'sqlsrv',
-                            'Server' => $options['host'] . ($isPort ? ',' . $port : ''),
-                            'Database' => $options['database']
-                        ];
-
-                        if (isset($options['appname'])) {
-                            $attr['APP'] = $options['appname'];
-                        }
-
-                        $config = [
-                            'ApplicationIntent',
-                            'AttachDBFileName',
-                            'Authentication',
-                            'ColumnEncryption',
-                            'ConnectionPooling',
-                            'Encrypt',
-                            'Failover_Partner',
-                            'KeyStoreAuthentication',
-                            'KeyStorePrincipalId',
-                            'KeyStoreSecret',
-                            'LoginTimeout',
-                            'MultipleActiveResultSets',
-                            'MultiSubnetFailover',
-                            'Scrollable',
-                            'TraceFile',
-                            'TraceOn',
-                            'TransactionIsolation',
-                            'TransparentNetworkIPResolution',
-                            'TrustServerCertificate',
-                            'WSID',
-                        ];
-
-                        foreach ($config as $value) {
-                            $keyname = strtolower(preg_replace(['/([a-z\d])([A-Z])/', '/([^_])([A-Z][a-z])/'], '$1_$2', $value));
-
-                            if (isset($options[$keyname])) {
-                                $attr[$value] = $options[$keyname];
-                            }
-                        }
-                    }
-
-                    break;
-
-                case 'sqlite':
-                    $attr = [
-                        'driver' => 'sqlite',
-                        $options['database']
-                    ];
-
-                    break;
-            }
+            $commands[] = "SET NAMES '{$options['charset']}'" . $collateString;
         }
 
-        if (!isset($attr)) {
-            throw new InvalidArgumentException('Incorrect connection options.');
-        }
+        return $commands;
+    }
 
-        $driver = $attr['driver'];
+    private function isDriverSupported(string $driver) : bool {
+        return in_array($driver, PDO::getAvailableDrivers());
+    }
 
-        if (!in_array($driver, PDO::getAvailableDrivers())) {
-            throw new InvalidArgumentException("Unsupported PDO driver: {$driver}.");
-        }
-
-        unset($attr['driver']);
-
+    private function makeStack(array $attr) : array {
         $stack = [];
 
         foreach ($attr as $key => $value) {
             $stack[] = is_int($key) ? $value : $key . '=' . $value;
         }
 
-        $dsn = $driver . ':' . implode(';', $stack);
+        return $stack;
+    }
 
-        if (
-            in_array($this->type, ['mysql', 'pgsql', 'sybase', 'mssql']) &&
-            isset($options['charset'])
-        ) {
-            $commands[] = "SET NAMES '{$options['charset']}'" . (
-                $this->type === 'mysql' && isset($options['collation']) ?
-                " COLLATE '{$options['collation']}'" : ''
+    private function connectToDatabase(string $dsn, array $options, array $commands) : void {
+        $this->pdo = new PDO(
+            $dsn,
+            $options['username'] ?? null,
+            $options['password'] ?? null,
+            $options['option'] ?? []
+        );
+
+        if (isset($options['error'])) {
+            $this->pdo->setAttribute(
+                PDO::ATTR_ERRMODE,
+                in_array($options['error'], [
+                    PDO::ERRMODE_SILENT,
+                    PDO::ERRMODE_WARNING,
+                    PDO::ERRMODE_EXCEPTION
+                ]) ?
+                $options['error'] :
+                PDO::ERRMODE_SILENT
             );
         }
 
-        $this->dsn = $dsn;
+        $this->executeCommands($commands);
+    }
 
-        try {
-            $this->pdo = new PDO(
-                $dsn,
-                $options['username'] ?? null,
-                $options['password'] ?? null,
-                $option
-            );
-
-            if (isset($options['error'])) {
-                $this->pdo->setAttribute(
-                    PDO::ATTR_ERRMODE,
-                    in_array($options['error'], [
-                        PDO::ERRMODE_SILENT,
-                        PDO::ERRMODE_WARNING,
-                        PDO::ERRMODE_EXCEPTION
-                    ]) ?
-                    $options['error'] :
-                    PDO::ERRMODE_SILENT
-                );
-            }
-
-            foreach ($commands as $value) {
-                $this->pdo->exec($value);
-            }
-        } catch (PDOException $e) {
-            throw new PDOException($e->getMessage());
+    private function executeCommands(array $commands) : void {
+        foreach ($commands as $value) {
+            $this->pdo->exec($value);
         }
     }
 
@@ -522,53 +428,25 @@ class Medoo
         }
 
         if ($this->debugMode) {
-            if ($this->debugLogging) {
-                $this->debugLogs[] = $this->generate($statement, $map);
-                return null;
-            }
-
-            echo $this->generate($statement, $map);
-
-            $this->debugMode = false;
-
-            return null;
+            return $this->generateDebugLogs($statement, $map);
         }
 
-        if ($this->logging) {
-            $this->logs[] = [$statement, $map];
-        } else {
-            $this->logs = [[$statement, $map]];
-        }
+        $this->logStatement($statement, $map);
 
         $statement = $this->pdo->prepare($statement);
-        $errorInfo = $this->pdo->errorInfo();
 
-        if ($errorInfo[0] !== '00000') {
-            $this->errorInfo = $errorInfo;
-            $this->error = $errorInfo[2];
-
+        try {
+            $this->handleErrorInfo($this->pdo->errorInfo());
+        } catch(ErrorException $e) {
             return null;
         }
+        
+        $statement = $this->bindStatementValues($statement, $map);
+        $execute = $this->tryToExecuteCallback($callback, $statement);
 
-        foreach ($map as $key => $value) {
-            $statement->bindValue($key, $value[0], $value[1]);
-        }
-
-        if (is_callable($callback)) {
-            $this->pdo->beginTransaction();
-            $callback($statement);
-            $execute = $statement->execute();
-            $this->pdo->commit();
-        } else {
-            $execute = $statement->execute();
-        }
-
-        $errorInfo = $statement->errorInfo();
-
-        if ($errorInfo[0] !== '00000') {
-            $this->errorInfo = $errorInfo;
-            $this->error = $errorInfo[2];
-
+        try {
+            $this->handleErrorInfo($statement->errorInfo());
+        } catch(ErrorException $e) {
             return null;
         }
 
@@ -579,6 +457,56 @@ class Medoo
         return $statement;
     }
 
+    private function generateDebugLogs(string $statement, array $map) : ?string {
+        if ($this->debugLogging) {
+            $this->debugLogs[] = $this->generate($statement, $map);
+            return null;
+        }
+
+        echo $this->generate($statement, $map);
+
+        $this->debugMode = false;
+
+        return null;
+    }
+
+    private function logStatement(string $statement, array $map) : void {
+        if ($this->logging) {
+            $this->logs[] = [$statement, $map];
+        } else {
+            $this->logs = [[$statement, $map]];
+        }
+    }
+
+    private function handleErrorInfo(array $errorInfo) : void {
+        if ($errorInfo[0] !== '00000') {
+            $this->errorInfo = $errorInfo;
+            $this->error = $errorInfo[2];
+
+            throw new ErrorException("An error occured");
+        }
+    }
+
+    private function tryToExecuteCallback($callback, PDOStatement &$statement) {
+        if (is_callable($callback)) {
+            $this->pdo->beginTransaction();
+            $callback($statement);
+            $execute = $statement->execute();
+            $this->pdo->commit();
+        } else {
+            $execute = $statement->execute();
+        }
+
+        return $execute;
+    }
+
+    private function bindStatementValues(PDOStatement $statement, array $map) : object {
+        foreach ($map as $key => $value) {
+            $statement->bindValue($key, $value[0], $value[1]);
+        }
+
+        return $statement;
+    }
     /**
      * Generate readable statement.
      *
@@ -594,27 +522,32 @@ class Medoo
             'mssql' => '[$1]'
         ];
 
-        $statement = preg_replace(
-            '/(?!\'[^\s]+\s?)"([\p{L}_][\p{L}\p{N}@$#\-_]*)"(?!\s?[^\s]+\')/u',
-            $identifier[$this->type] ?? '"$1"',
-            $statement
-        );
+        $statement = preg_replace(self::STMT_REPLACE_REGEX, $identifier[$this->type] ?? '"$1"', $statement);
 
+        return $this->generateStatement($statement, $map);
+    }
+
+    private function generateStatement(string $statement, array $map) : string {
         foreach ($map as $key => $value) {
-            if ($value[1] === PDO::PARAM_STR) {
-                $replace = $this->quote($value[0]);
-            } elseif ($value[1] === PDO::PARAM_NULL) {
-                $replace = 'NULL';
-            } elseif ($value[1] === PDO::PARAM_LOB) {
-                $replace = '{LOB_DATA}';
-            } else {
-                $replace = $value[0] . '';
-            }
-
+            $replace = $this->getReplaceValue($value);
             $statement = str_replace($key, $replace, $statement);
         }
 
         return $statement;
+    }
+
+    private function getReplaceValue(array $value) : string {
+        if ($value[1] === PDO::PARAM_STR) {
+            $replace = $this->quote($value[0]);
+        } elseif ($value[1] === PDO::PARAM_NULL) {
+            $replace = 'NULL';
+        } elseif ($value[1] === PDO::PARAM_LOB) {
+            $replace = '{LOB_DATA}';
+        } else {
+            $replace = $value[0] . '';
+        }
+
+        return $replace;
     }
 
     /**
@@ -658,21 +591,19 @@ class Medoo
             return null;
         }
 
-        $query = preg_replace_callback(
-            '/(([`\']).*?)?((FROM|TABLE|INTO|UPDATE|JOIN)\s*)?\<(([\p{L}_][\p{L}\p{N}@$#\-_]*)(\.[\p{L}_][\p{L}\p{N}@$#\-_]*)?)\>([^,]*?\2)?/u',
-            function ($matches) {
-                if (!empty($matches[2]) && isset($matches[8])) {
-                    return $matches[0];
-                }
+        $callback = function ($matches) {
+            if (!empty($matches[2]) && isset($matches[8])) {
+                return $matches[0];
+            }
 
-                if (!empty($matches[4])) {
-                    return $matches[1] . $matches[4] . ' ' . $this->tableQuote($matches[5]);
-                }
+            if (!empty($matches[4])) {
+                return $matches[1] . $matches[4] . ' ' . $this->tableQuote($matches[5]);
+            }
 
-                return $matches[1] . $this->columnQuote($matches[5]);
-            },
-            $raw->value
-        );
+            return $matches[1] . $this->columnQuote($matches[5]);
+        };
+
+        $query = preg_replace_callback(self::QUERY_REPLACE_REGEX, $callback, $raw->value);
 
         $rawMap = $raw->map;
 
@@ -708,7 +639,7 @@ class Medoo
      */
     public function tableQuote(string $table): string
     {
-        if (preg_match('/^[\p{L}_][\p{L}\p{N}@$#\-_]*$/u', $table)) {
+        if (preg_match(self::TABLE_QUOTE_REGEX, $table)) {
             return '"' . $this->prefix . $table . '"';
         }
 
@@ -723,7 +654,7 @@ class Medoo
      */
     public function columnQuote(string $column): string
     {
-        if (preg_match('/^[\p{L}_][\p{L}\p{N}@$#\-_]*(\.?[\p{L}_][\p{L}\p{N}@$#\-_]*)?$/u', $column)) {
+        if (preg_match(self::COLUMN_QUOTE_REGEX, $column)) {
             return strpos($column, '.') !== false ?
                 '"' . $this->prefix . str_replace('.', '"."', $column) . '"' :
                 '"' . $column . '"';
@@ -741,23 +672,13 @@ class Medoo
      */
     protected function typeMap($value, string $type): array
     {
-        $map = [
-            'NULL' => PDO::PARAM_NULL,
-            'integer' => PDO::PARAM_INT,
-            'double' => PDO::PARAM_STR,
-            'boolean' => PDO::PARAM_BOOL,
-            'string' => PDO::PARAM_STR,
-            'object' => PDO::PARAM_STR,
-            'resource' => PDO::PARAM_LOB
-        ];
-
         if ($type === 'boolean') {
             $value = ($value ? '1' : '0');
         } elseif ($type === 'NULL') {
             $value = null;
         }
 
-        return [$value, $map[$type]];
+        return [$value, self::PDO_TYPE_MAP[$type]];
     }
 
     /**
@@ -844,10 +765,7 @@ class Medoo
         foreach ($data as $key => $value) {
             $type = gettype($value);
 
-            if (
-                $type === 'array' &&
-                preg_match("/^(AND|OR)(\s+#.*)?$/", $key, $relationMatch)
-            ) {
+            if ($type === 'array' && preg_match("/^(AND|OR)(\s+#.*)?$/", $key, $relationMatch)) {
                 $stack[] = '(' . $this->dataImplode($value, $map, ' ' . $relationMatch[1]) . ')';
                 continue;
             }
@@ -1853,14 +1771,7 @@ class Medoo
 
         foreach ($columns as $column => $replacements) {
             if (is_array($replacements)) {
-                foreach ($replacements as $old => $new) {
-                    $mapKey = $this->mapKey();
-                    $columnName = $this->columnQuote($column);
-                    $stack[] = "{$columnName} = REPLACE({$columnName}, {$mapKey}a, {$mapKey}b)";
-
-                    $map[$mapKey . 'a'] = [$old, PDO::PARAM_STR];
-                    $map[$mapKey . 'b'] = [$new, PDO::PARAM_STR];
-                }
+                $map = $this->getReplaceMappingFor($map, $replacements, $column, $stack);
             }
         }
 
@@ -1869,6 +1780,19 @@ class Medoo
         }
 
         return $this->exec('UPDATE ' . $this->tableQuote($table) . ' SET ' . implode(', ', $stack) . $this->whereClause($where, $map), $map);
+    }
+
+    private function getReplaceMappingFor(array $map, array $replacements, string $column, array &$stack) : array {
+        foreach ($replacements as $old => $new) {
+            $mapKey = $this->mapKey();
+            $columnName = $this->columnQuote($column);
+            $stack[] = "{$columnName} = REPLACE({$columnName}, {$mapKey}a, {$mapKey}b)";
+
+            $map[$mapKey . 'a'] = [$old, PDO::PARAM_STR];
+            $map[$mapKey . 'b'] = [$new, PDO::PARAM_STR];
+        }
+
+        return $map;
     }
 
     /**
@@ -1969,12 +1893,10 @@ class Medoo
      */
     public function rand(string $table, $join = null, $columns = null, $where = null): array
     {
-        $orderRaw = $this->raw(
-            $this->type === 'mysql' ? 'RAND()'
-                : ($this->type === 'mssql' ? 'NEWID()'
-                : 'RANDOM()')
-        );
-
+        $mssqlFunction = $this->type === 'mssql' ? 'NEWID()' : 'RANDOM()';
+        $rand = $this->type === 'mysql' ? 'RAND()' : $mssqlFunction;
+        $orderRaw = $this->raw($rand);
+        
         if ($where === null) {
             if ($this->isJoin($join)) {
                 $where['ORDER'] = $orderRaw;
@@ -2212,20 +2134,13 @@ class Medoo
      */
     public function info(): array
     {
-        $output = [
-            'server' => 'SERVER_INFO',
-            'driver' => 'DRIVER_NAME',
-            'client' => 'CLIENT_VERSION',
-            'version' => 'SERVER_VERSION',
-            'connection' => 'CONNECTION_STATUS'
-        ];
+        $output = [];
 
-        foreach ($output as $key => $value) {
+        foreach (self::MEDOO_INFO_OUTPUT as $key => $value) {
             $output[$key] = @$this->pdo->getAttribute(constant('PDO::ATTR_' . $value));
         }
 
         $output['dsn'] = $this->dsn;
-
         return $output;
     }
 }
